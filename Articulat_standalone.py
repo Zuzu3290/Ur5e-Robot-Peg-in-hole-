@@ -10,6 +10,12 @@ from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.core.api.world import World
 from pxr import UsdPhysics
 import asyncio
+import omni
+import omni.physx as _physx
+import carb
+from pxr import UsdGeom
+from omni.timeline import get_timeline_interface
+from isaacsim.sensors.physics import _sensor
 
 #ur5e joint names
 joints_name = [
@@ -21,6 +27,9 @@ joints_name = [
     "wrist_3_joint"         # index 5
     ]
 
+CONTACT_SENSOR_PATH = "/World/ur5e/wrist_3_link/ur5e_peg/Contact_Sensor"
+PRINT_EVERY_N_STEPS = 10
+
 def deg2rad(joint_deg):
     return np.deg2rad(np.array(joint_deg, dtype=np.float32))
 
@@ -31,7 +40,7 @@ def current_positions(robot_view,joints_name):
     for i in range(len(joints_name)):
         print(f" {joints_name[i]}: {positions[i]}")
 
-async def action(robot_view, joint_positions, articulation_controller,arti_view, joint_link_id):
+async def action(robot_view, joint_positions, articulation_controller,arti_view, joint_link_id, contact_sensor_interface):
     joints_name = [
     "shoulder_pan_joint",   # index 0
     "shoulder_lift_joint",  # index 1
@@ -42,7 +51,7 @@ async def action(robot_view, joint_positions, articulation_controller,arti_view,
     ]
 
     current_positions(robot_view,joints_name)
-    action = ArticulationAction(joint_positions , joint_velocities=np.array([0.02] * 6), joint_indices=[0, 1, 2, 3, 4, 5])
+    action = ArticulationAction(joint_positions , joint_velocities=np.array([0.2] * 6), joint_indices=[0, 1, 2, 3, 4, 5])
     articulation_controller.apply_action(action)
 
     await asyncio.sleep(5.0)
@@ -55,6 +64,13 @@ async def action(robot_view, joint_positions, articulation_controller,arti_view,
   
     #Pause this async function until the next Kit (Isaac Sim) update frame has completed.
     await omni.kit.app.get_app().next_update_async()
+
+    # Contact sensor application
+    reading = contact_sensor_interface.get_sensor_reading(CONTACT_SENSOR_PATH)
+
+    if reading.is_valid:
+        force_n = float(reading.value)
+        carb.log_info(f"[Peg Contact] Force = {force_n:.4f} N")
 
     await joint_sensor(arti_view, joint_link_id)
 
@@ -89,6 +105,7 @@ async def joint_sensor(arti_view, joint_link_id):
         print(f"  Actuation Effort: {joint_effort}")
         print("-" * 40)
 
+
 async def articulation_controller():
     if World.instance():
         World.instance().clear_instance()
@@ -98,7 +115,7 @@ async def articulation_controller():
     world.scene.add_default_ground_plane()
     
     # Load the robot USD file
-    usd_path = r"C:\Users\zuhai\Desktop\IRP\ur5e_robot_calibrated\ur5e_rework.usd"
+    usd_path = r"C:\Users\zuhai\Desktop\IRP\ur5e_robot_calibrated\ur5e.usd"
     prim_path = "/World/ur5e"
     hole_prim_path = "/World/ur5e_hole"
     add_reference_to_stage(usd_path, prim_path)
@@ -136,6 +153,11 @@ async def articulation_controller():
         joint_link_id[joint_name] = child_link_index
     print("joint link IDs", joint_link_id)
 
+    
+    #timeline = get_timeline_interface()
+    #the upper code is used to modulate if simulation is being operated manually
+    contact_sensor_interface = _sensor.acquire_contact_sensor_interface()
+
     # Run simulation
     await world.play_async()
 
@@ -143,25 +165,25 @@ async def articulation_controller():
     current_positions(robot_view, joints_name)
 
     # articulation points 
-    INITIAL = deg2rad([0, -41.4, 39.0, -90, -85.3, 147])
-    ACT_1   = deg2rad([0, -25.6, 32.9, -90, -85.3, 147])
-    ACT_2   = deg2rad([-1.9, -27.1, 36.6, -90, -85.3, 147])
-    ACT_3   = deg2rad([-1.9, -24.8, 36.6, -90, -85.3, 147])
+    INITIAL = deg2rad([2.1, -48.3, 46.7, -89.6, -91.7, 0.0])
+    ACT_1   = deg2rad([2.1, -22.1, 25.2, -89.6, -91.7, 0.0])
+    ACT_2   = deg2rad([0.8, -19.1, 23.2, -89.6, -91.7, 0.0])
+    ACT_3   = deg2rad([0.8, -19.1, 25.2, -89.6, -91.7, 0.0])
 
     # Get current joint positions
-    await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id)  # Run for 5 seconds to reach target positions
+    await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id, contact_sensor_interface)  # Run for 5 seconds to reach target positions
 
-    await action(robot_view, ACT_1, articulation_controller, arti_view, joint_link_id)    # Run for 5 seconds to reach target positions
+    await action(robot_view, ACT_1, articulation_controller, arti_view, joint_link_id, contact_sensor_interface)    # Run for 5 seconds to reach target positions
 
-    await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id)    # Run for 5 seconds to reach target positions 
+    await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id, contact_sensor_interface)    # Run for 5 seconds to reach target positions 
 
-    await action(robot_view, ACT_2, articulation_controller, arti_view, joint_link_id)    # Run for 5 seconds to reach target positions
+    await action(robot_view, ACT_2, articulation_controller, arti_view, joint_link_id, contact_sensor_interface)    # Run for 5 seconds to reach target positions
 
-    await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id)    # Run for 5 seconds to reach target positions
+    await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id, contact_sensor_interface)    # Run for 5 seconds to reach target positions
 
-    await action(robot_view, ACT_3, articulation_controller, arti_view, joint_link_id)    # Run for 5 seconds to reach target positions
+    await action(robot_view, ACT_3, articulation_controller, arti_view, joint_link_id, contact_sensor_interface)    # Run for 5 seconds to reach target positions
 
-    await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id)    # Run for 5 seconds to reach target positions
+    await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id, contact_sensor_interface)    # Run for 5 seconds to reach target positions
 
     world.pause()
 
