@@ -1,9 +1,9 @@
 import pandas as pd
 import matplotlib.pyplot as plt
-
+import os
 # Load and preprocess the data
-def load_joint_data(file_path: str) -> pd.DataFrame:
-    df = pd.read_csv(file_path, sep="|")
+def load_joint_data() -> pd.DataFrame:
+    df = pd.read_csv("joint_data.csv", sep="|")
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df
 
@@ -25,7 +25,8 @@ def extract_phase_intervals(df: pd.DataFrame):
 
 # General plotting function
 def plot_joint_data(df: pd.DataFrame, joints_name: list, value_column: str, 
-                    ylabel: str, line_color: str, phase_colors: dict):
+                    ylabel: str, line_color: str, phase_colors: dict,
+                    save_path: str = None):
     
     phase_intervals = extract_phase_intervals(df)
     
@@ -52,11 +53,18 @@ def plot_joint_data(df: pd.DataFrame, joints_name: list, value_column: str,
     fig.legend(handles=legend_patches, loc="upper right", title="Phase")
 
     plt.tight_layout(rect=[0, 0, 0.95, 1])
-    plt.show()
 
+    # Save the figure if save_path is provided
+    if save_path:
+        folder = os.path.dirname(save_path)
+        if folder:  # create folder only if folder path exists
+            os.makedirs(folder, exist_ok=True)
+        fig.savefig(save_path, dpi=300)
+        print(f"Plot saved to: {save_path}")
+    
+    plt.close(fig)
 # Main execution
-file_path = "joint_data.csv"
-df = load_joint_data(file_path)
+df = load_joint_data()
 
 joints_name = [
     "shoulder_pan_joint",
@@ -74,8 +82,23 @@ phase_colors = {
     "ACT_3": "#F9E79F",     # yellow
 }
 
-# Plot Force
-plot_joint_data(df, joints_name, value_column="force_N", ylabel="Force (N)", line_color="black", phase_colors=phase_colors)
+plot_joint_data(
+    df, 
+    joints_name, 
+    value_column="force_N", 
+    ylabel="Force (N)", 
+    line_color="black", 
+    phase_colors=phase_colors,
+    save_path="joint_force_plot.png"
+)
 
-# Plot Torque
-plot_joint_data(df, joints_name, value_column="torque_Nm", ylabel="Torque (Nm)", line_color="purple", phase_colors=phase_colors)
+# Save Torque plot in current workspace
+plot_joint_data(
+    df, 
+    joints_name, 
+    value_column="torque_Nm", 
+    ylabel="Torque (Nm)", 
+    line_color="purple", 
+    phase_colors=phase_colors,
+    save_path="joint_torque_plot.png"
+)
