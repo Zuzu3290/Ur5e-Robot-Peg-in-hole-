@@ -17,6 +17,8 @@ from isaacsim.sensors.physics import _sensor
 
 
 Contact_Sensor_path = "/World/ur5e/wrist_3_link/ur5e_peg/Contact_Sensor"
+output_dir = r"C:\Users\zuhai\Desktop\IRP\ur5e_robot_calibrated\joint_data.csv"
+joint_log = [] 
 
 #ur5e joint names
 joints_name = [
@@ -29,12 +31,14 @@ joints_name = [
     ]
 
 def log_joint_data(joint_name, position, force, torque):
-    data = {
-        "Joint_name": [joint_name],
-        "Joint position": [position],
-        "Force": [force],
-        "Torque": [torque]
-    }
+    joint_log.append({
+        "joint_name": joint_name,
+        "position_rad": float(position),
+        "force_N": float(force),
+        "torque_Nm": float(torque),
+        "timestamp": omni.timeline.get_timeline_interface().get_current_time(),
+        "phase": current_phase
+    })
 
 def vector_magnitude(v):
     
@@ -88,7 +92,7 @@ async def action(robot_view, joint_positions, articulation_controller,arti_view,
 
     await asyncio.sleep(5.0)
 
-async def joint_sensor(arti_view, joint_link_id, positions):
+async def joint_sensor(arti_view, joint_link_id, positions):    
 
     joints_name = [
     "shoulder_pan_joint",   # index 0
@@ -193,24 +197,42 @@ async def articulation_controller(joints_name=joints_name):
     ACT_2   = deg2rad([-4.3, -30.4, 38.5, -90, -92.4, 0.0])
     ACT_3   = deg2rad([-4.3, -28.2, 38.5, -90, -92.4, 0.0])
 
+    global current_phase
     # Get current joint positions
+    current_phase = "INITIAL"
     await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id, contact_sensor)  # Run for 5 seconds to reach target positions
 
+    current_phase = "ACT_1"
     await action(robot_view, ACT_1, articulation_controller, arti_view, joint_link_id, contact_sensor)    # Run for 5 seconds to reach target positions
 
+    current_phase = "INITIAL"
     await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id, contact_sensor)    # Run for 5 seconds to reach target positions 
 
+    current_phase = "ACT_2"
     await action(robot_view, ACT_2, articulation_controller, arti_view, joint_link_id, contact_sensor)    # Run for 5 seconds to reach target positions
 
+    current_phase = "INITIAL"
     await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id, contact_sensor)    # Run for 5 seconds to reach target positions
 
+    current_phase = "ACT_3"
     await action(robot_view, ACT_3, articulation_controller, arti_view, joint_link_id, contact_sensor)    # Run for 5 seconds to reach target positions
 
+    current_phase = "INITIAL"
     await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id, contact_sensor)    # Run for 5 seconds to reach target positions
+    
+    df = pd.DataFrame(joint_log)
+    print(f"[DEBUG] Logged joint samples: {len(joint_log)}")
+    print(df.head())
+    df.to_csv(output_dir, sep='|', index=False, mode='w', header=True, columns=[
+        "joint_name",
+        "position_rad",
+        "force_N",
+        "torque_Nm",
+        "timestamp",
+        "phase"
+    ])
+    print(f"[INFO] Joint data saved to:\n{output_dir}")
 
     world.pause()
-
-    df = pd.DataFrame(data)
-    df.to_csv('joint_data.csv', sep='|', index=False, mode='a',columns=[...],header=True)
 # Run the example
 asyncio.ensure_future(articulation_controller())
