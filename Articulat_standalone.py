@@ -18,8 +18,9 @@ from isaacsim.sensors.physics import _sensor
 
 Contact_Sensor_path = "/World/ur5e/wrist_3_link/ur5e_peg/Contact_Sensor"
 output_dir = r"C:\Users\zuhai\Desktop\IRP\ur5e_robot_calibrated\joint_data.csv"
+contact_sensor_path = r"C:\Users\zuhai\Desktop\IRP\ur5e_robot_calibrated\contact_sensor_data.csv"
 joint_log = [] 
-
+contact_sensor_log = []
 #ur5e joint names
 joints_name = [
     "shoulder_pan_joint",   # index 0
@@ -37,6 +38,14 @@ def log_joint_data(joint_name, position, force, torque):
         "force_N": float(force),
         "torque_Nm": float(torque),
         "timestamp": omni.timeline.get_timeline_interface().get_current_time(),
+        "phase": current_phase
+    })
+
+def log_contact_data(contact_force, step):
+    contact_sensor_log.append({
+        "contact_force_N": float(contact_force),
+        "timestamp": omni.timeline.get_timeline_interface().get_current_time(),
+        "Step_number" : step,
         "phase": current_phase
     })
 
@@ -69,7 +78,7 @@ async def action(robot_view, joint_positions, articulation_controller,arti_view,
     ]
 
     current_positions(robot_view,joints_name)
-    action = ArticulationAction(joint_positions , joint_velocities=np.array([0.2] * 6), joint_indices=[0, 1, 2, 3, 4, 5])
+    action = ArticulationAction(joint_positions , joint_velocities=np.array([0.0,0.005,0.02,0.0,0.0,0.0]), joint_indices=[0, 1, 2, 3, 4, 5])
     articulation_controller.apply_action(action)
     
     for step in range(600):  # ~10 seconds
@@ -79,13 +88,13 @@ async def action(robot_view, joint_positions, articulation_controller,arti_view,
         if reading.is_valid:
             if reading.value > 0:
                 print(f"[{step}] Contact force: {reading.value:.4f} N")
+                log_contact_data(reading.value, step)
 
     positions = robot_view.get_joint_positions()
     positions = positions.detach().numpy().flatten()
     
     await omni.kit.app.get_app().next_update_async()
     # Contact sensor application
-
     await joint_sensor(arti_view, joint_link_id, positions)
 
     await omni.kit.app.get_app().next_update_async()
@@ -181,10 +190,6 @@ async def articulation_controller(joints_name=joints_name):
         joint_link_id[joint_name] = child_link_index
     print("joint link IDs", joint_link_id)
 
-    # physx_api = PhysxSchema.PhysxArticulationAPI.Apply(prim_path)
-    # physx_api.CreateEnableJointForceSensorsAttr(True)
-    # physx_api.CreateEnableJointVelocitySensorsAttr(True)
-
     # Run simulation
     await world.play_async()
 
@@ -221,18 +226,12 @@ async def articulation_controller(joints_name=joints_name):
     await action(robot_view, INITIAL, articulation_controller, arti_view, joint_link_id, contact_sensor)    # Run for 5 seconds to reach target positions
     
     df = pd.DataFrame(joint_log)
-    print(f"[DEBUG] Logged joint samples: {len(joint_log)}")
-    print(df.head())
-    df.to_csv(output_dir, sep='|', index=False, mode='w', header=True, columns=[
-        "joint_name",
-        "position_rad",
-        "force_N",
-        "torque_Nm",
-        "timestamp",
-        "phase"
-    ])
-    print(f"[INFO] Joint data saved to:\n{output_dir}")
+    df.to_csv(output_dir, sep='|', index=False, mode='w', header=True, columns=[ "joint_name", "position_rad", "force_N", "torque_Nm", "timestamp","phase"])
+    
+    df  = pd.DataFrame(contact_sensor_log)
+    df.to_csv(contact_sensor_path, sep='|', index=False, mode='w', header=True, columns=[ "contact_force_N", "timestamp","Step_number","phase"])
 
     world.pause()
+
 # Run the example
 asyncio.ensure_future(articulation_controller())
