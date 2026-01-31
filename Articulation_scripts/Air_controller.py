@@ -2,11 +2,11 @@ import asyncio
 import numpy as np
 import omni
 import carb
+from pxr import UsdGeom, Gf
 
 from isaacsim.core.api.world import World
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.stage import add_reference_to_stage
-from isaacsim.core.utils.types import ArticulationAction
 
 from isaacsim.robot_motion.motion_generation import (
     ArticulationKinematicsSolver,
@@ -14,239 +14,148 @@ from isaacsim.robot_motion.motion_generation import (
     interface_config_loader,
 )
 
-
+# ----------------------------
+# SETTINGS
+# ----------------------------
 USD_PATH = r"C:\Users\zuhai\Desktop\IRP\ur5e_robot_calibrated\ur5e_rework.usd"
 ROBOT_PRIM = "/World/ur5e"
-EEF_FRAME_NAME = "wrist_3_link"  #  end-effector 
 
-# Trajectory tuning
-TRAJ_DURATION_S = 2.0     # how long to reach the target
-N_WAYPOINTS = 80          # more = smoother, slower compute
-MAX_QD_RAD_S = 1.2        # joint velocity clamp (rad/s)
+# Kinematics end-effector frame name (must be in lula_solver.get_all_frame_names())
+EEF_FRAME_NAME = "wrist_3_link"
 
-# Debug
-PRINT_EVERY_STEPS = 120
-WARN_EVERY_STEPS = 60
+# USD prim path where we attach a visual marker for EEF (just for visualization)
+EEF_VIS_PRIM_PATH = "/World/ur5e/wrist_3_link"
+EE_MARKER_PRIM = EEF_VIS_PRIM_PATH + "/ee_marker_cube"
 
+# World target cube you DRAG
+TARGET_CUBE_PRIM = "/World/target_cube"
 
-#Global State Variables need to evualted and checked for inclusion and use in the controller
+# Keep wrist_3_link at least this far from cube center (meters)
+STANDOFF_M = 0.08
+
+PRINT_EVERY = 60
+WARN_EVERY = 30
+
+# ----------------------------
+# GLOBALS
+# ----------------------------
 world = None
 robot = None
+stage = None
 lula_solver = None
 ik = None
-physics_dt = None
 
-# target request
-requested_target_xyz = None
-need_new_plan = False
+target_cube_prim = None
+ee_marker_prim = None
 
-# planned joint trajectory
-traj_active = False
-traj_times = None     # (N,)
-traj_q = None         # (N, dof)
-traj_qd = None        # (N, dof)
-traj_t = 0.0
-
+step_count = 0
 last_good_action = None
-step_counter = 0
 
 
-# Helpers
 def to_np(x, dtype=np.float64):
-    # tensor backend solver compatibility
+    """Convert torch Tensor / list to numpy array."""
     if hasattr(x, "detach"):
         return x.detach().cpu().numpy().astype(dtype)
     return np.asarray(x, dtype=dtype)
 
-#Smoothstep interpolation function accleration stability
-def smoothstep_cubic(s: float) -> float:
-    return 3.0 * s * s - 2.0 * s * s * s
 
-# Velocity clamp function
-def clamp_qd(qd: np.ndarray, max_abs: float) -> np.ndarray:
-    #Protect from excessive joint velocities, maintaining IK solver output direction
-    return np.clip(qd, -max_abs, max_abs)
+def create_colored_cube(stage, prim_path: str, size=0.06, color=(1.0, 0.65, 0.65), pos=(0.0, 0.0, 0.0)):
+    """Create/reuse a USD cube with displayColor and a translate op."""
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        cube = UsdGeom.Cube.Define(stage, prim_path)
+        cube.CreateSizeAttr(float(size))
+        prim = stage.GetPrimAtPath(prim_path)
+    else:
+        cube = UsdGeom.Cube(prim)
+        cube.CreateSizeAttr(float(size))
 
-# end-effector target position function. Setting a Cartesian target
-def set_target_xyz(x: float, y: float, z: float):
-    global requested_target_xyz, need_new_plan
-    requested_target_xyz = np.array([x, y, z], dtype=np.float64)
-    need_new_plan = True
-    carb.log_info(f"[set_target_xyz] New target requested: {requested_target_xyz}")
+    gprim = UsdGeom.Gprim(prim)
+    gprim.CreateDisplayColorAttr([Gf.Vec3f(*color)])
+    gprim.CreateDisplayOpacityAttr([1.0])
 
-# PLANNING: Cartesian waypoints -> IK -> joint waypoints + velocities
-def plan_joint_trajectory(target_xyz: np.ndarray):
-    """
-    Builds a joint trajectory q(t), qdot(t) by:
-      1) reading current EE pose (wrist_3_link)
-      2) generating smooth Cartesian waypoints
-      3) IK each waypoint -> joint positions
-      4) finite-difference -> joint velocities
-    Returns (times, q, qd) or (None, None, None) on failure.
-    """
-    global robot, lula_solver, ik
-
-    # Sync Lula base pose (IMPORTANT when backend="torch")
-    b_pos, b_quat = robot.get_world_pose()
-    lula_solver.set_robot_base_pose(to_np(b_pos), to_np(b_quat))
-
-    # Current end-effector pose (FK-like feedback)
-    ee_pos, ee_quat = ik.compute_end_effector_pose(position_only=False)
-    ee_pos = np.asarray(ee_pos, dtype=np.float64)
-
-    # Current joints
-    q0 = to_np(robot.get_joint_positions()).flatten()
-    dof = q0.shape[0]
-
-    # Build smooth Cartesian waypoints
-    cart_wp = np.zeros((N_WAYPOINTS, 3), dtype=np.float64)
-    for k in range(N_WAYPOINTS):
-        s = k / (N_WAYPOINTS - 1)
-        s = smoothstep_cubic(s)
-        cart_wp[k] = (1 - s) * ee_pos + s * target_xyz
-
-    # IK each waypoint -> q
-    q_wp = np.zeros((N_WAYPOINTS, dof), dtype=np.float64)
-    q_prev = q0.copy()
-    last_success_idx = -1
-
-    for i in range(N_WAYPOINTS):
-        action, success = ik.compute_inverse_kinematics(
-            target_position=cart_wp[i],
-            target_orientation=None,  # position-only
-            position_tolerance=None,
-            orientation_tolerance=None,
-        )
-
-        if not success:
-            carb.log_warn(f"[plan] IK failed at waypoint {i}/{N_WAYPOINTS-1}. Truncating trajectory.")
+    xform = UsdGeom.Xformable(prim)
+    ops = xform.GetOrderedXformOps()
+    t_op = None
+    for op in ops:
+        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+            t_op = op
             break
+    if t_op is None:
+        t_op = xform.AddTranslateOp()
 
-        q = np.asarray(action.joint_positions, dtype=np.float64).flatten()
+    t_op.Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+    return prim
 
-        # Map subset output into full joint vector if needed
-        if q.shape[0] == dof:
-            q_full = q
-        else:
-            q_full = q_prev.copy()
-            if action.joint_indices is not None:
-                for j, ji in enumerate(action.joint_indices):
-                    q_full[int(ji)] = q[j]
-            else:
-                q_full[: q.shape[0]] = q
 
-        q_wp[i] = q_full
-        q_prev = q_full
-        last_success_idx = i
+def get_world_translation(prim):
+    """Live world position from USD (updates immediately when you drag in viewport)."""
+    mat = omni.usd.get_world_transform_matrix(prim)
+    t = mat.ExtractTranslation()
+    return np.array([t[0], t[1], t[2]], dtype=np.float64)
 
-    # Need at least 2 points to execute
-    if last_success_idx < 1:
-        carb.log_warn("[plan] Planning failed: not enough valid IK points.")
-        return None, None, None
 
-    # Truncate to valid points
-    q_wp = q_wp[: last_success_idx + 1]
-    n = q_wp.shape[0]
-
-    # Time grid
-    times = np.linspace(0.0, TRAJ_DURATION_S, n, dtype=np.float64)
-
-    # Velocities (finite difference)
-    qd_wp = np.zeros_like(q_wp)
-    for i in range(1, n):
-        dt = times[i] - times[i - 1]
-        if dt < 1e-9:
-            qd_wp[i] = 0.0
-        else:
-            qd_wp[i] = (q_wp[i] - q_wp[i - 1]) / dt
-            qd_wp[i] = clamp_qd(qd_wp[i], MAX_QD_RAD_S)
-    qd_wp[0] = qd_wp[1].copy()
-
-    carb.log_info(f"[plan] Planned {n} joint waypoints over {TRAJ_DURATION_S:.2f}s.")
-    return times, q_wp, qd_wp
-
-# q(t) Positions → linear interpolation, qd(t) Velocities → constant per segment, induction and computation. Trajectory sampling
-def sample_piecewise_linear(times: np.ndarray, q_wp: np.ndarray, qd_wp: np.ndarray, t: float):
+def compute_standoff_target(ee_pos: np.ndarray, cube_pos: np.ndarray, standoff_m: float) -> np.ndarray:
     """
-    Piecewise-linear interpolation for positions.
-    Velocities are taken from segment qd (or interpolated lightly).
-    Returns (q, qd).
+    Ensure target point is at least standoff_m away from cube center along cube->EE direction.
+    This makes wrist_3_link stop at a safe distance instead of touching/penetrating.
     """
-    if t <= times[0]:
-        return q_wp[0].copy(), qd_wp[0].copy()
-    if t >= times[-1]:
-        return q_wp[-1].copy(), qd_wp[-1].copy()
+    v = ee_pos - cube_pos
+    dist = float(np.linalg.norm(v))
+    if dist < 1e-6:
+        return cube_pos + np.array([0.0, 0.0, standoff_m], dtype=np.float64)
+    return cube_pos + (v / dist) * standoff_m
 
-    i = int(np.searchsorted(times, t) - 1)
-    t0, t1 = times[i], times[i + 1]
-    q0, q1 = q_wp[i], q_wp[i + 1]
-    qd0 = qd_wp[i]
 
-    dt = t1 - t0
-    if dt < 1e-9:
-        return q0.copy(), np.zeros_like(q0)
-
-    a = (t - t0) / dt
-    q = (1 - a) * q0 + a * q1
-    # keep constant segment velocity (stable)
-    qd = qd0.copy()
-    return q, qd
-
-# Physics step callback
 def on_physics_step(dt: float):
-    global need_new_plan, requested_target_xyz
-    global traj_active, traj_times, traj_q, traj_qd, traj_t
-    global last_good_action, step_counter
+    global step_count, last_good_action
+    global robot, lula_solver, ik, target_cube_prim, ee_marker_prim
 
     timeline = omni.timeline.get_timeline_interface()
     if not timeline.is_playing():
         return
 
-    step_counter += 1
+    step_count += 1
 
-    # Plan if new target requested
-    if need_new_plan and requested_target_xyz is not None:
-        need_new_plan = False
+    # 1) Cartesian target pose: read dragged cube world position
+    cube_pos = get_world_translation(target_cube_prim)
 
-        times, q_wp, qd_wp = plan_joint_trajectory(requested_target_xyz)
-        if times is None:
-            traj_active = False
-            return
+    # 2) Current EEF position (wrist_3_link visual marker)
+    ee_pos = get_world_translation(ee_marker_prim)
 
-        traj_times, traj_q, traj_qd = times, q_wp, qd_wp
-        traj_t = 0.0
-        traj_active = True
+    # 3) Enforce standoff distance (safe Cartesian target position)
+    target_pos = compute_standoff_target(ee_pos, cube_pos, STANDOFF_M)
 
-    # Execute current trajectory
-    if traj_active and traj_times is not None:
-        q, qd = sample_piecewise_linear(traj_times, traj_q, traj_qd, traj_t)
+    # 4) Update Lula base pose (numpy only; backend is torch)
+    b_pos, b_quat = robot.get_world_pose()
+    lula_solver.set_robot_base_pose(to_np(b_pos), to_np(b_quat))
 
-        action = ArticulationAction(
-            joint_positions=q,
-            joint_velocities=qd,
-            joint_indices=list(range(len(q))),
-        )
+    # 5) Compute IK -> ArticulationAction
+    action, success = ik.compute_inverse_kinematics(
+        target_position=target_pos,
+        target_orientation=None,  # position-only tracking
+        position_tolerance=None,
+        orientation_tolerance=None,
+    )
 
+    # 6) Apply action (and handle out-of-range)
+    if success:
         robot.apply_action(action)
         last_good_action = action
+    else:
+        # Hold last valid posture instead of "nullifying"
+        if last_good_action is not None:
+            robot.apply_action(last_good_action)
+        if step_count % WARN_EVERY == 0:
+            carb.log_warn("IK failed (likely out of reachable range). Holding last valid posture.")
 
-        traj_t += dt
-        if traj_t >= float(traj_times[-1]):
-            traj_active = False
-            carb.log_info("[exec] Trajectory finished.")
+    if step_count % PRINT_EVERY == 0:
+        carb.log_info(f"[{step_count}] IK success={success} cube={cube_pos} target={target_pos} standoff={STANDOFF_M}m")
 
-    # Debug prints
-    if step_counter % PRINT_EVERY_STEPS == 0:
-        msg = f"[step {step_counter}] active={traj_active}"
-        if requested_target_xyz is not None:
-            msg += f" target={requested_target_xyz}"
-        carb.log_info(msg)
 
-# Main async init
 async def main():
-    global world, robot, lula_solver, ik, physics_dt
+    global world, robot, stage, lula_solver, ik, target_cube_prim, ee_marker_prim
 
-    # reset world instance
     if World.instance():
         World.instance().clear_instance()
 
@@ -255,7 +164,7 @@ async def main():
     await omni.kit.app.get_app().next_update_async()
     world.scene.add_default_ground_plane()
 
-    # load robot
+    # Load robot
     add_reference_to_stage(USD_PATH, ROBOT_PRIM)
     await omni.kit.app.get_app().next_update_async()
 
@@ -263,28 +172,47 @@ async def main():
     world.scene.add(robot)
 
     await world.reset_async(soft=False)
+    stage = omni.usd.get_context().get_stage()
 
-    physics_dt = float(world.get_physics_dt())
-    carb.log_info(f"[init] Physics dt = {physics_dt}")
+    # Visual EEF marker (blue) attached under wrist_3_link
+    ee_marker_prim = create_colored_cube(
+        stage,
+        EE_MARKER_PRIM,
+        size=0.035,
+        color=(0.6, 0.8, 1.0),
+        pos=(0.0, 0.0, 0.0),
+    )
+    await omni.kit.app.get_app().next_update_async()
 
-    # kinematics config 
+    # Target cube (light red) in world (drag this)
+    target_cube_prim = create_colored_cube(
+        stage,
+        TARGET_CUBE_PRIM,
+        size=0.06,
+        color=(1.0, 0.65, 0.65),
+        pos=(0.45, 0.0, 0.35),
+    )
+    await omni.kit.app.get_app().next_update_async()
+
+    # Lula kinematics
     kcfg = interface_config_loader.load_supported_lula_kinematics_solver_config("UR5e")
     lula_solver = LulaKinematicsSolver(**kcfg)
 
     frames = lula_solver.get_all_frame_names()
-    carb.log_info(f"[init] EEF '{EEF_FRAME_NAME}' in frames? {EEF_FRAME_NAME in frames}")
+    carb.log_info(f"EEF '{EEF_FRAME_NAME}' in frames? {EEF_FRAME_NAME in frames}")
 
+    # IK wrapper: returns ArticulationAction directly
     ik = ArticulationKinematicsSolver(robot, lula_solver, EEF_FRAME_NAME)
 
-    # callback
-    world.add_physics_callback("coord_target_ik_traj", on_physics_step)
+    # Live update loop
+    world.add_physics_callback("cartesian_target_ik_servo", on_physics_step)
 
+    # Start simulation
     await world.play_async()
 
-    set_target_xyz(0.45, 0.0, 0.35)
 
-# Run
 asyncio.ensure_future(main())
+
 
 
 #Issue presists that we need a loop induction. The program doesnt compute change in enf_effector coordinate during runtimee. 
